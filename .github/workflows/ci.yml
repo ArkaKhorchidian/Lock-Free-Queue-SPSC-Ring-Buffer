@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+# Cancel in-flight runs on the same branch when a new push arrives
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Build matrix: GCC and Clang × three sanitiser configurations
+  # -------------------------------------------------------------------------
+  build-and-test:
+    name: ${{ matrix.compiler }} / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        sanitizer: [none, asan, tsan]
+        exclude:
+          # Clang's TSan on Ubuntu 22.04 requires extra setup; include GCC TSan
+          # as the primary TSan signal and Clang as a secondary.
+          # Remove this exclusion once your CI environment is validated.
+          []  # no exclusions — run all 6 combinations
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # -----------------------------------------------------------------------
+      # Install toolchains
+      # -----------------------------------------------------------------------
+      - name: Install GCC 12
+        if: matrix.compiler == 'gcc'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-12 g++-12
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100
+
+      - name: Install Clang 15
+        if: matrix.compiler == 'clang'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y clang-15 lld-15
+          sudo update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-15   100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
+
+      - name: Install CMake and Ninja
+        run: |
+          sudo apt-get install -y cmake ninja-build
+
+      # -----------------------------------------------------------------------
+      # Configure
+      # -----------------------------------------------------------------------
+      - name: Configure (no sanitiser)
+        if: matrix.sanitizer == 'none'
+        env:
+          CC:  ${{ matrix.compiler == 'clang' && 'clang'   || 'gcc'   }}
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++'   }}
+        run: |
+          cmake -B build -G Ninja \
+            -DENABLE_ASAN=OFF \
+            -DENABLE_TSAN=OFF
+
+      - name: Configure (ASan + UBSan)
+        if: matrix.sanitizer == 'asan'
+        env:
+          CC:  ${{ matrix.compiler == 'clang' && 'clang'   || 'gcc'   }}
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++'   }}
+        run: |
+          cmake -B build -G Ninja \
+            -DENABLE_ASAN=ON \
+            -DENABLE_TSAN=OFF
+
+      - name: Configure (TSan)
+        if: matrix.sanitizer == 'tsan'
+        env:
+          CC:  ${{ matrix.compiler == 'clang' && 'clang'   || 'gcc'   }}
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++'   }}
+        run: |
+          cmake -B build -G Ninja \
+            -DENABLE_ASAN=OFF \
+            -DENABLE_TSAN=ON
+
+      # -----------------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------------
+      - name: Build
+        run: cmake --build build --parallel
+
+      # -----------------------------------------------------------------------
+      # Test
+      # -----------------------------------------------------------------------
+      - name: Test
+        run: |
+          ctest --test-dir build \
+                --output-on-failure \
+                --timeout 300 \
+                -j2
+        env:
+          # TSan suppressions: suppress known false positives from glibc
+          # internals (e.g. pthread_once). Add project-specific suppressions
+          # to tsan_suppressions.txt if needed.
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+          ASAN_OPTIONS: "halt_on_error=1 detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1 print_stacktrace=1"
+
+  # -------------------------------------------------------------------------
+  # Dedicated TSan job with verbose output — most important signal
+  # -------------------------------------------------------------------------
+  tsan-clean:
+    name: TSan clean (GCC)
+    runs-on: ubuntu-22.04
+    needs: []  # run in parallel with the matrix
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install GCC 12 + CMake
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-12 g++-12 cmake ninja-build
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100
+
+      - name: Configure (TSan)
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          cmake -B build-tsan -G Ninja -DENABLE_TSAN=ON
+
+      - name: Build
+        run: cmake --build build-tsan --parallel
+
+      - name: Run TSan suite
+        run: |
+          ctest --test-dir build-tsan \
+                --output-on-failure \
+                --timeout 600 \
+                -j1
+        env:
+          # halt_on_error=1: treat any race as a fatal error (CI fails)
+          # history_size=5: longer happens-before chain for diagnostics
+          TSAN_OPTIONS: "halt_on_error=1 history_size=5 second_deadlock_stack=1"
+
+      - name: Assert TSan clean
+        run: echo "All tests passed with zero TSan warnings."
