@@ -88,8 +88,19 @@ namespace latency_harness {
 // Requires knowing the TSC frequency.  We use a conservative default of
 // 3 GHz (one cycle ≈ 0.333 ns).  For accurate conversion, read from
 // /sys/devices/system/cpu/cpu0/tsc_freq_khz or calibrate at startup.
+//
+// On non-x86 targets the "cycles" above are std::chrono::steady_clock ticks,
+// not TSC cycles, so the default divisor is ticks-per-nanosecond derived from
+// steady_clock::period (1.0 for the usual nanosecond clock).  Dividing those
+// ticks by 3.0 would under-report every latency by 3x on ARM64 / Apple Silicon.
 // ---------------------------------------------------------------------------
+#if defined(__x86_64__) || defined(_M_X64)
 constexpr double kDefaultTscGhz = 3.0;
+#else
+constexpr double kDefaultTscGhz =
+    static_cast<double>(std::chrono::steady_clock::period::den) /
+    (static_cast<double>(std::chrono::steady_clock::period::num) * 1e9);
+#endif
 
 [[nodiscard]] inline double cycles_to_ns(std::uint64_t cycles,
                                          double tsc_ghz = kDefaultTscGhz) noexcept {
