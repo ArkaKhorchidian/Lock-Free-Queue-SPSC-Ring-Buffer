@@ -3,11 +3,18 @@
 
 #include <atomic>
 #include <array>
+#include <cstddef>   // offsetof
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <thread>
 #include <chrono>
 #include <type_traits>
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // False Sharing Demonstration
@@ -110,9 +117,6 @@ static void run_bench(const char* name, int producer_core, int consumer_core) {
     static constexpr int N = 20'000'000;
 
     Queue q;
-
-    std::vector<uint64_t> latencies;
-    latencies.reserve(N);
 
     using Clock = std::chrono::steady_clock;
     Clock::time_point t_start, t_end;
